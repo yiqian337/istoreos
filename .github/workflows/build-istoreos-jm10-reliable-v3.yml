@@ -1,0 +1,350 @@
+name: Build iStoreOS for YIJIAHE JM10
+
+# v3: normalize new Linux Kconfig symbols automatically
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "wyapx/istoreos branch or tag"
+        required: true
+        default: "istoreos-24.10"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-istoreos-jm10-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: https://github.com/wyapx/istoreos.git
+  SOURCE_REF: ${{ inputs.source_ref }}
+  TZ: Asia/Singapore
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: Build JM10 firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -hT
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint bc binutils bison build-essential \
+            bzip2 clang cmake cpio curl device-tree-compiler file flex \
+            g++ gawk gcc-multilib g++-multilib gettext git gperf help2man \
+            libelf-dev liblzma-dev libncurses-dev libssl-dev libtool \
+            libxml-parser-perl ninja-build patch perl pkg-config \
+            python3 python3-dev python3-distutils python3-pyelftools \
+            python3-setuptools qemu-utils rsync scons squashfs-tools \
+            subversion swig texinfo time unzip wget xsltproc xxd \
+            zlib1g-dev zstd jq
+
+          python3 - <<'PY'
+          from elftools.elf.elffile import ELFFile
+          print("python3-pyelftools: OK")
+          PY
+
+          sudo apt-get clean
+          df -hT
+
+      - name: Clone iStoreOS source
+        id: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            --filter=blob:none \
+            --single-branch \
+            --branch "${SOURCE_REF}" \
+            "${SOURCE_REPO}" \
+            openwrt
+
+          mkdir -p openwrt/dl openwrt/logs
+
+          SOURCE_COMMIT="$(git -C openwrt rev-parse HEAD)"
+          echo "commit=${SOURCE_COMMIT}" >> "${GITHUB_OUTPUT}"
+
+          git -C openwrt log -1 --format=fuller
+          df -hT
+
+      - name: Verify JM10 profile exists
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          grep -Rqs 'define Device/yijiahe_jm10' target/linux/rockchip/image/ || {
+            echo "YIJIAHE JM10 profile was not found in source ref: ${SOURCE_REF}"
+            exit 1
+          }
+
+      - name: Restore download cache
+        id: dl-cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: openwrt/dl
+          key: istoreos-jm10-dl-${{ runner.os }}-${{ inputs.source_ref }}-${{ steps.source.outputs.commit }}-${{ hashFiles('openwrt/feeds.conf.default') }}
+          restore-keys: |
+            istoreos-jm10-dl-${{ runner.os }}-${{ inputs.source_ref }}-
+            istoreos-jm10-dl-${{ runner.os }}-
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          updated=false
+          for attempt in 1 2 3; do
+            echo "Feeds update attempt ${attempt}/3"
+            if ./scripts/feeds update -a; then
+              updated=true
+              break
+            fi
+            sleep $((attempt * 15))
+          done
+
+          if [[ "${updated}" != true ]]; then
+            echo "Feeds update failed after three attempts."
+            exit 1
+          fi
+
+          ./scripts/feeds install -a
+
+      - name: Configure author-default JM10 profile
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > .config <<'EOF'
+          CONFIG_TARGET_rockchip=y
+          CONFIG_TARGET_rockchip_armv8=y
+          CONFIG_TARGET_rockchip_armv8_DEVICE_yijiahe_jm10=y
+          EOF
+
+          make defconfig
+
+          grep -q \
+            '^CONFIG_TARGET_rockchip_armv8_DEVICE_yijiahe_jm10=y$' \
+            .config
+
+          ./scripts/diffconfig.sh > config.diff
+
+          echo "===== Target ====="
+          grep -E '^CONFIG_TARGET_rockchip' .config
+
+          echo "===== Packages selected by the JM10 profile ====="
+          grep -E \
+            '^CONFIG_PACKAGE_(kmod-hwmon-pwmfan|kmod-thermal|kmod-dsa-mv88e6xxx|kmod-brcmfmac|rkwifi-firmware-ap6275p)=' \
+            .config || true
+
+      - name: Verify build prerequisites
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          make prereq V=s 2>&1 | tee logs/prereq.log
+
+      - name: Download source packages
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          downloaded=false
+
+          for attempt in 1 2 3; do
+            echo "Download attempt ${attempt}/3"
+
+            if make download -j8; then
+              downloaded=true
+              break
+            fi
+
+            sleep $((attempt * 15))
+          done
+
+          if [[ "${downloaded}" != true ]]; then
+            echo "Parallel downloads did not complete; retrying verbosely."
+            make download -j1 V=s
+          fi
+
+          # Do not reject files merely because they are smaller than 1 KiB.
+          # The author's AP6275P package intentionally downloads a tiny,
+          # valid nvram_ap6275p.txt file.
+          test -s dl/nvram_ap6275p.txt
+
+          df -hT
+
+      - name: Save download cache
+        uses: actions/cache/save@v5
+        with:
+          path: openwrt/dl
+          key: ${{ steps.dl-cache-restore.outputs.cache-primary-key }}
+
+      - name: Refresh Rockchip kernel configuration
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # The fork's Rockchip config does not answer every Kconfig symbol
+          # introduced by Linux 6.6.141. Accept the kernel default for all
+          # newly introduced symbols and write the normalized configuration
+          # back to the Rockchip armv8 target config in one pass.
+          set +e
+          yes "" | make -j1 target/linux/oldconfig CONFIG_TARGET=subtarget V=s 2>&1 |
+            tee logs/kernel-oldconfig.log
+          make_status="${PIPESTATUS[1]}"
+          set -e
+
+          if [[ "${make_status}" -ne 0 ]]; then
+            echo "target/linux/oldconfig failed with status ${make_status}"
+            exit "${make_status}"
+          fi
+
+          git diff -- target/linux/rockchip/armv8/config-6.6 |
+            tee kernel-config-adjustment.patch
+
+          if grep -Eq '\(NEW\).*Error|Restart config.*Error|syncconfig.*Error' logs/kernel-oldconfig.log; then
+            echo "Kernel configuration is still incomplete."
+            exit 1
+          fi
+
+      - name: Build firmware
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          JOBS="$(nproc)"
+          echo "Building with ${JOBS} parallel jobs."
+
+          if make -j"${JOBS}" world 2>&1 | tee logs/build.log; then
+            echo "Parallel build completed."
+          else
+            echo "Parallel build failed."
+            echo "Retrying unfinished targets with one job and verbose output."
+            make -j1 V=s world 2>&1 | tee -a logs/build.log
+          fi
+
+          df -hT
+
+      - name: Collect firmware and build information
+        working-directory: openwrt
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          TARGET_DIR="bin/targets/rockchip/armv8"
+          OUTPUT_DIR="../output"
+
+          test -d "${TARGET_DIR}"
+          mkdir -p "${OUTPUT_DIR}"
+
+          find "${TARGET_DIR}" \
+            -maxdepth 1 \
+            -type f \
+            -exec cp -v {} "${OUTPUT_DIR}/" \;
+
+          cp -v .config "${OUTPUT_DIR}/config.full"
+          cp -v config.diff "${OUTPUT_DIR}/config.diff"
+          cp -v kernel-config-adjustment.patch \
+            "${OUTPUT_DIR}/kernel-config-adjustment.patch"
+
+          git rev-parse HEAD > "${OUTPUT_DIR}/source-commit.txt"
+          git remote -v > "${OUTPUT_DIR}/source-remotes.txt"
+          ./scripts/feeds list -f > "${OUTPUT_DIR}/feeds.list" || true
+
+          SYSUPGRADE="$(
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name '*yijiahe_jm10*sysupgrade*.img.gz' \
+              -print \
+              -quit
+          )"
+
+          if [[ -z "${SYSUPGRADE}" ]]; then
+            echo "JM10 sysupgrade image was not generated."
+            find "${TARGET_DIR}" -maxdepth 2 -type f -print
+            exit 1
+          fi
+
+          (
+            cd "${OUTPUT_DIR}"
+            sha256sum ./* > SHA256SUMS-GITHUB
+          )
+
+          {
+            echo "## iStoreOS JM10 build"
+            echo
+            echo "- Source ref: \`${SOURCE_REF}\`"
+            echo "- Source commit: \`${{ steps.source.outputs.commit }}\`"
+            echo "- Runner: \`${{ runner.os }} / ${{ runner.arch }}\`"
+            echo
+            echo "### Firmware"
+            find "${OUTPUT_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -printf -- '- `%f`\n' |
+              sort
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          ls -lah "${OUTPUT_DIR}"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v7
+        with:
+          name: istoreos-jm10-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: istoreos-jm10-${{ github.run_number }}-diagnostics
+          path: |
+            openwrt/.config
+            openwrt/config.diff
+            openwrt/kernel-config-adjustment.patch
+            openwrt/logs/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
+
+      - name: Show final disk usage
+        if: always()
+        shell: bash
+        run: df -hT
